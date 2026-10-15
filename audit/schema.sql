@@ -27,10 +27,13 @@ CREATE TABLE IF NOT EXISTS audit_events (
     reviewer_id       TEXT,
     decision          TEXT     NOT NULL,
     reason            TEXT,
-    execution_time_ms INTEGER  NOT NULL CHECK (execution_time_ms >= 0)
+    execution_time_ms INTEGER  NOT NULL CHECK (execution_time_ms >= 0),
+    event_key         TEXT
 );
 
 CREATE INDEX IF NOT EXISTS audit_events_thread_idx   ON audit_events (thread_id, id);
 CREATE INDEX IF NOT EXISTS audit_events_pr_idx       ON audit_events (pr_url, timestamp DESC);
 CREATE INDEX IF NOT EXISTS audit_events_decision_idx ON audit_events (decision);
 CREATE INDEX IF NOT EXISTS audit_events_risk_idx     ON audit_events (risk_level);
+CREATE UNIQUE INDEX IF NOT EXISTS audit_events_dedupe_idx
+    ON audit_events (thread_id, event_key) WHERE event_key IS NOT NULL;

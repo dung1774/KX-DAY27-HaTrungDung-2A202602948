@@ -17,7 +17,7 @@ import asyncio
 from rich.console import Console
 from rich.table import Table
 
-from common.db import db_conn, replay_events
+from common.db import list_review_sessions, replay_events
 
 
 RISK_COLOR = {"low": "green", "med": "yellow", "high": "red"}
@@ -25,22 +25,7 @@ RISK_COLOR = {"low": "green", "med": "yellow", "high": "red"}
 
 async def list_threads() -> None:
     console = Console()
-    async with db_conn() as conn:
-        async with conn.execute(
-            """
-            SELECT thread_id,
-                   pr_url,
-                   MIN(timestamp)        AS started,
-                   MAX(timestamp)        AS last_event,
-                   MAX(risk_level)       AS worst_risk,
-                   COUNT(*)              AS events
-              FROM audit_events
-             GROUP BY thread_id, pr_url
-             ORDER BY MAX(timestamp) DESC
-             LIMIT 25
-            """
-        ) as cur:
-            rows = await cur.fetchall()
+    rows = await list_review_sessions()
 
     table = Table(title="Recent review sessions")
     for col in ("thread_id", "pr_url", "started", "last_event", "worst_risk", "events"):

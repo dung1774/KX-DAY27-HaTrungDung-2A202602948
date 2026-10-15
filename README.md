@@ -136,6 +136,18 @@ uv sync                                     # install Python deps
 cp .env.example .env && $EDITOR .env        # set OPENROUTER_API_KEY and GITHUB_TOKEN
 ```
 
+Trên Windows PowerShell:
+
+```powershell
+uv sync
+Copy-Item .env.example .env
+notepad .env
+```
+
+Để smoke test mà chắc chắn không đăng comment thật, đặt `HITL_DRY_RUN=true` trong
+tiến trình chạy. Chế độ này vẫn fetch PR và phân tích bình thường nhưng trả về
+`final_action=dry_run` ở bước ghi GitHub.
+
 The SQLite file `hitl_audit.db` is created on demand when exercise 4 runs.
 
 ## Demo PRs

@@ -1,179 +1,288 @@
-"""Exercise 5 — Streamlit approval UI for the HITL PR review agent.
+"""Streamlit UI for the durable Human-in-the-Loop PR review agent.
 
-Run with:
-    uv run streamlit run app.py
-
-Goal: wrap the LangGraph built in exercises 1–4 in a web UI that adapts to
-the confidence bucket of each PR.
-
-Routing thresholds (common/schemas.py):
-    > 72%        auto_approve     UI shows a success card; reviewer does nothing
-    58 – 72%     human_approval   UI shows Approve / Reject / Edit buttons
-    <  58%       escalate         UI shows a question form for the reviewer
+Run with: ``uv run streamlit run app.py``.
 """
 
 from __future__ import annotations
 
 import asyncio
 import uuid
+from typing import Any
 
 import streamlit as st
 from dotenv import load_dotenv
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
-from common.db import db_path
-# TODO: import the graph builder + helpers from your exercise 4 solution.
-# Suggestion: rename `exercises/exercise_4_audit.py` functions you need
-# (build_graph, handle_interrupt logic) and import them here, OR copy the
-# graph wiring inline.
-# from exercises.exercise_4_audit import build_graph
+from common.db import db_path, list_review_sessions
+from common.github import parse_pr_url
+from exercises.exercise_4_audit import build_graph
 
 
 load_dotenv()
 
 
-# ─── Session state ─────────────────────────────────────────────────────────
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = None
-if "pr_url" not in st.session_state:
-    st.session_state.pr_url = ""
-if "interrupt_payload" not in st.session_state:
-    st.session_state.interrupt_payload = None
-if "final" not in st.session_state:
-    st.session_state.final = None
+def _interrupt_from_snapshot(snapshot) -> Any | None:
+    for task in snapshot.tasks:
+        if task.interrupts:
+            return task.interrupts[0]
+    return None
 
 
-# ─── Page setup ────────────────────────────────────────────────────────────
-st.set_page_config(page_title="HITL PR Review", layout="wide")
-st.title("HITL PR Review Agent")
+async def run_graph(
+    pr_url: str,
+    thread_id: str,
+    resume_value: Any = None,
+    *,
+    load_only: bool = False,
+) -> dict[str, Any]:
+    """Start, resume, or load one durable graph session."""
+    async with AsyncSqliteSaver.from_conn_string(db_path()) as checkpointer:
+        await checkpointer.setup()
+        graph = build_graph(checkpointer)
+        config = {"configurable": {"thread_id": thread_id}}
+
+        if load_only:
+            snapshot = await graph.aget_state(config)
+            if not snapshot.values:
+                raise ValueError(f"Không tìm thấy checkpoint cho thread {thread_id}")
+            pending = _interrupt_from_snapshot(snapshot)
+            if pending is not None:
+                return {"__interrupt__": (pending,), "__values__": dict(snapshot.values)}
+            return dict(snapshot.values)
+
+        if resume_value is None:
+            return await graph.ainvoke(
+                {
+                    "pr_url": pr_url,
+                    "thread_id": thread_id,
+                    "require_final_confirmation": True,
+                },
+                config,
+            )
+        return await graph.ainvoke(Command(resume=resume_value), config)
 
 
-# ─── Sidebar — recent sessions ─────────────────────────────────────────────
-with st.sidebar:
-    st.header("Recent sessions")
-    # TODO: call `audit.replay.list_threads`-style query against audit_events
-    # and render thread_id + pr_url + worst_risk + last_event as a small table.
-    # On row click, set st.session_state.thread_id and rerun.
-    st.caption("(TODO — populate from audit_events)")
+def _record_result(result: dict[str, Any]) -> None:
+    if "__interrupt__" in result:
+        st.session_state.interrupt_payload = result["__interrupt__"][0].value
+        st.session_state.final = None
+        values = result.get("__values__", {})
+        if values.get("pr_url"):
+            st.session_state.pr_url = values["pr_url"]
+    else:
+        st.session_state.interrupt_payload = None
+        st.session_state.final = result
 
 
-# ─── Top form — start a new review ─────────────────────────────────────────
-with st.form("start"):
-    pr_url = st.text_input(
-        "PR URL", value=st.session_state.pr_url,
-        placeholder="https://github.com/VinUni-AI20k/PR-Demo/pull/1",
-    )
-    submitted = st.form_submit_button("Run review")
+def _comment_rows(payload: dict[str, Any]) -> None:
+    for comment in payload.get("comments", []):
+        st.markdown(
+            f"- **[{comment['severity']}]** "
+            f"`{comment['file']}:{comment.get('line') or '?'}` — {comment['body']}"
+        )
 
 
-# ─── Renderers per interrupt kind ──────────────────────────────────────────
-def render_approval_card(payload: dict) -> dict | None:
-    """58–72% bucket: show the LLM review + 3 buttons. Return resume dict or None."""
-    conf = payload["confidence"]
-    st.subheader(f"Approval requested — confidence {conf:.0%}")
+def render_approval_card(payload: dict[str, Any]) -> dict[str, Any] | None:
+    """Render the normal or post-escalation final approval card."""
+    refined = payload["kind"] == "refined_approval"
+    title = "Xác nhận refined review" if refined else "Yêu cầu phê duyệt"
+    st.subheader(f"{title} — confidence {payload['confidence']:.0%}")
     st.caption(payload["confidence_reasoning"])
     st.markdown(payload["summary"])
+    if payload.get("risk_factors"):
+        st.warning("Risk factors: " + "; ".join(payload["risk_factors"]))
+    _comment_rows(payload)
 
-    for c in payload.get("comments", []):
-        st.markdown(f"- **[{c['severity']}]** `{c['file']}:{c.get('line') or '?'}` — {c['body']}")
-
-    with st.expander("Diff"):
+    with st.expander("Diff", expanded=False):
         st.code(payload.get("diff_preview", ""), language="diff")
 
-    feedback = st.text_input("Feedback (optional)", key="approval_feedback")
-    col1, col2, col3 = st.columns(3)
-    # TODO: hook up the three buttons. Each click should return one of:
-    #   {"choice": "approve", "feedback": feedback}
-    #   {"choice": "reject",  "feedback": feedback}
-    #   {"choice": "edit",    "feedback": feedback}
-    if col1.button("Approve", type="primary"):
-        ...  # return {"choice": "approve", ...}
-    if col2.button("Reject"):
-        ...
-    if col3.button("Edit"):
-        ...
+    key_prefix = f"{st.session_state.thread_id}_{payload['kind']}"
+    feedback = st.text_input("Feedback (không bắt buộc)", key=f"feedback_{key_prefix}")
+    edit_key = f"edit_mode_{key_prefix}"
+    col_approve, col_reject, col_edit = st.columns(3)
+    if col_approve.button("Approve", type="primary", key=f"approve_{key_prefix}"):
+        return {"choice": "approve", "feedback": feedback}
+    if col_reject.button("Reject", key=f"reject_{key_prefix}"):
+        return {"choice": "reject", "feedback": feedback}
+    if col_edit.button("Edit", key=f"edit_{key_prefix}"):
+        st.session_state[edit_key] = True
+
+    if st.session_state.get(edit_key):
+        edited_review = st.text_area(
+            "Chỉnh sửa review Markdown trước khi đăng",
+            value=payload.get("draft_review", ""),
+            height=280,
+            key=f"edited_review_{key_prefix}",
+        )
+        if st.button("Submit edited review", type="primary", key=f"submit_edit_{key_prefix}"):
+            if not edited_review.strip():
+                st.error("Nội dung review sau khi sửa không được để trống.")
+            else:
+                st.session_state[edit_key] = False
+                return {
+                    "choice": "edit",
+                    "feedback": feedback,
+                    "edited_review": edited_review,
+                }
     return None
 
 
-def render_escalation_card(payload: dict) -> dict | None:
-    """< 58% bucket: show risk factors + question form. Return {question: answer} or None."""
-    conf = payload["confidence"]
-    st.subheader(f"Strong escalation — confidence {conf:.0%}")
+def render_escalation_card(payload: dict[str, Any]) -> dict[str, str] | None:
+    """Render one answer box per concrete escalation question."""
+    st.subheader(f"Strong escalation — confidence {payload['confidence']:.0%}")
     st.caption(payload["confidence_reasoning"])
-    if payload.get("risk_factors"):
-        st.error("Risks: " + ", ".join(payload["risk_factors"]))
     st.markdown(payload["summary"])
+    if payload.get("risk_factors"):
+        st.error("Risk factors: " + "; ".join(payload["risk_factors"]))
+    with st.expander("Diff", expanded=False):
+        st.code(payload.get("diff_preview", ""), language="diff")
 
-    with st.form("escalation"):
-        # TODO: render one text_input per question in payload["questions"]
-        #       collect answers into a dict {question: answer_str}
-        #       on submit, return the dict.
-        answers: dict[str, str] = {}
-        st.form_submit_button("Submit answers")
+    answers: dict[str, str] = {}
+    with st.form(f"escalation_{st.session_state.thread_id}"):
+        for index, question in enumerate(payload["questions"], start=1):
+            answers[question] = st.text_area(
+                f"{index}. {question}", key=f"answer_{st.session_state.thread_id}_{index}"
+            )
+        submitted_answers = st.form_submit_button("Gửi câu trả lời", type="primary")
+    if submitted_answers:
+        missing = [question for question, answer in answers.items() if not answer.strip()]
+        if missing:
+            st.error("Vui lòng trả lời đầy đủ tất cả câu hỏi trước khi tiếp tục.")
+            return None
+        return answers
     return None
 
 
-# ─── Drive the graph ───────────────────────────────────────────────────────
-async def run_graph(pr_url: str, thread_id: str, resume_value=None):
-    """Invoke the graph once. Returns the final result or {'__interrupt__': ...}."""
-    async with AsyncSqliteSaver.from_conn_string(db_path()) as cp:
-        await cp.setup()
-        # TODO: build the graph with `cp` as the checkpointer (use the function
-        # you imported/copied at the top of this file).
-        # app = build_graph(cp)
-        cfg = {"configurable": {"thread_id": thread_id}}
-
-        # TODO:
-        # - If resume_value is None: result = await app.ainvoke(
-        #       {"pr_url": pr_url, "thread_id": thread_id}, cfg)
-        # - Else:                    result = await app.ainvoke(
-        #       Command(resume=resume_value), cfg)
-        # - Return result.
-        raise NotImplementedError("Wire up the graph invocation")
+def _load_recent_sessions() -> list[dict[str, Any]]:
+    try:
+        return asyncio.run(list_review_sessions())
+    except Exception as exc:
+        st.sidebar.warning(f"Không thể đọc recent sessions: {exc}")
+        return []
 
 
-# ─── Main flow ─────────────────────────────────────────────────────────────
-if submitted and pr_url:
+def _reset_session_for_new_review(pr_url: str) -> None:
     st.session_state.pr_url = pr_url
     st.session_state.thread_id = str(uuid.uuid4())
     st.session_state.interrupt_payload = None
     st.session_state.final = None
+    st.session_state.error = None
 
-    with st.spinner("Fetching PR + asking the LLM..."):
-        result = asyncio.run(run_graph(pr_url, st.session_state.thread_id))
 
-    if "__interrupt__" in result:
-        st.session_state.interrupt_payload = result["__interrupt__"][0].value
+st.set_page_config(page_title="HITL PR Review Agent", layout="wide")
+st.title("HITL PR Review Agent")
+st.caption("Day 27 – Track 03 · Confidence routing, human approval và SQLite audit trail")
+
+for key, default in (
+    ("thread_id", None),
+    ("pr_url", ""),
+    ("interrupt_payload", None),
+    ("final", None),
+    ("error", None),
+):
+    if key not in st.session_state:
+        st.session_state[key] = default
+
+
+with st.sidebar:
+    st.header("Recent sessions")
+    sessions = _load_recent_sessions()
+    if sessions:
+        labels = {
+            f"{row['thread_id'][:8]} · {row['worst_risk']} · {row['pr_url']}": row
+            for row in sessions
+        }
+        selected_label = st.selectbox("Chọn session", list(labels), label_visibility="collapsed")
+        if st.button("Mở session", use_container_width=True):
+            selected = labels[selected_label]
+            st.session_state.thread_id = selected["thread_id"]
+            st.session_state.pr_url = selected["pr_url"]
+            st.session_state.error = None
+            try:
+                loaded = asyncio.run(run_graph(
+                    selected["pr_url"], selected["thread_id"], load_only=True
+                ))
+                _record_result(loaded)
+                st.rerun()
+            except Exception as exc:
+                st.session_state.error = f"Không thể mở session: {exc}"
     else:
-        st.session_state.final = result
+        st.caption("Chưa có audit session.")
 
-# Render the current interrupt card, if any
+
+with st.form("start"):
+    entered_pr_url = st.text_input(
+        "GitHub PR URL",
+        value=st.session_state.pr_url,
+        placeholder="https://github.com/VinUni-AI20k/PR-Demo/pull/1",
+    )
+    start_submitted = st.form_submit_button("Run Review", type="primary")
+
+if start_submitted:
+    try:
+        parse_pr_url(entered_pr_url)
+        _reset_session_for_new_review(entered_pr_url.strip())
+        with st.spinner("Đang tải PR và phân tích bằng AI..."):
+            first_result = asyncio.run(run_graph(
+                st.session_state.pr_url, st.session_state.thread_id
+            ))
+        _record_result(first_result)
+    except Exception as exc:
+        st.session_state.error = f"Không thể chạy review: {exc}"
+
+if st.session_state.error:
+    st.error(st.session_state.error)
+
 payload = st.session_state.interrupt_payload
 if payload is not None:
-    kind = payload["kind"]
-    answer = render_approval_card(payload) if kind == "approval_request" else render_escalation_card(payload)
-    if answer is not None:
-        with st.spinner("Resuming..."):
-            result = asyncio.run(run_graph(
-                st.session_state.pr_url, st.session_state.thread_id, resume_value=answer,
-            ))
-        if "__interrupt__" in result:
-            st.session_state.interrupt_payload = result["__interrupt__"][0].value
-        else:
-            st.session_state.interrupt_payload = None
-            st.session_state.final = result
-        st.rerun()
+    if payload["kind"] in {"approval_request", "refined_approval"}:
+        answer = render_approval_card(payload)
+    elif payload["kind"] == "escalation":
+        answer = render_escalation_card(payload)
+    else:
+        answer = None
+        st.error(f"Loại interrupt không được hỗ trợ: {payload['kind']}")
 
-# Render final state, if reached
-if st.session_state.final is not None:
-    final = st.session_state.final
-    action = final.get("final_action", "?")
-    if action.startswith("auto") or action.startswith("committed"):
-        st.success(f"✓ {action} — comment posted to {st.session_state.pr_url}")
+    if answer is not None:
+        try:
+            with st.spinner("Đang tiếp tục workflow..."):
+                resumed = asyncio.run(run_graph(
+                    st.session_state.pr_url,
+                    st.session_state.thread_id,
+                    resume_value=answer,
+                ))
+            _record_result(resumed)
+            st.session_state.error = None
+            st.rerun()
+        except Exception as exc:
+            st.session_state.error = f"Không thể tiếp tục session: {exc}"
+            st.error(st.session_state.error)
+
+final = st.session_state.final
+if final is not None:
+    action = final.get("final_action", "unknown")
+    analysis = final.get("analysis")
+    if analysis is not None:
+        st.metric("Confidence", f"{analysis.confidence:.0%}")
+        st.markdown(f"**Summary:** {analysis.summary}")
+
+    if action in {"auto_committed", "committed"}:
+        st.success("GitHub đã xác nhận review comment được đăng thành công.")
+        target = final.get("comment_url") or st.session_state.pr_url
+        st.link_button("Mở comment / PR trên GitHub", target)
     elif action == "rejected":
-        st.warning("Rejected — no comment posted")
+        st.warning("Review đã bị từ chối — không có comment nào được đăng.")
+        st.link_button("Mở PR trên GitHub", st.session_state.pr_url)
+    elif action == "dry_run":
+        st.info("Dry-run hoàn tất — comment không được đăng lên GitHub.")
+        st.link_button("Mở PR trên GitHub", st.session_state.pr_url)
+    elif action in {"commit_failed", "auto_commit_failed"}:
+        st.error("GitHub không xác nhận đăng comment. Kiểm tra token/quyền và audit log.")
     else:
         st.info(f"final_action = {action}")
-    st.caption(f"thread_id = {st.session_state.thread_id}  ·  replay: "
-               f"`uv run python -m audit.replay --thread {st.session_state.thread_id}`")
+
+    st.caption(
+        f"thread_id = {st.session_state.thread_id} · replay: "
+        f"`uv run python -m audit.replay --thread {st.session_state.thread_id}`"
+    )

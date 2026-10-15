@@ -19,6 +19,7 @@ from rich.panel import Panel
 
 from common.github import fetch_pr, post_review_comment
 from common.llm import get_llm
+from common.prompts import PR_REVIEW_SYSTEM_PROMPT
 from common.schemas import (
     AUTO_APPROVE_THRESHOLD,
     ESCALATE_THRESHOLD,
@@ -31,53 +32,65 @@ console = Console()
 
 
 def node_fetch_pr(state: ReviewState) -> dict:
-    console.print("[cyan]→ fetch_pr[/cyan]")
+    console.print("[cyan]-> fetch_pr[/cyan]")
     with console.status("[dim]Fetching PR from GitHub...[/dim]"):
         pr = fetch_pr(state["pr_url"])
-    console.print(f"  [green]✓[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
+    console.print(f"  [green]OK[/green] {len(pr.files_changed)} files, head {pr.head_sha[:7]}")
     return {"pr_title": pr.title, "pr_diff": pr.diff, "pr_files": pr.files_changed, "pr_head_sha": pr.head_sha}
 
 
 def node_analyze(state: ReviewState) -> dict:
-    console.print("[cyan]→ analyze[/cyan]")
+    console.print("[cyan]-> analyze[/cyan]")
     llm = get_llm().with_structured_output(PRAnalysis)
     with console.status("[dim]LLM reviewing the diff...[/dim]"):
         analysis = llm.invoke([
-            {"role": "system", "content": "Senior reviewer. Structured output."},
+            {"role": "system", "content": PR_REVIEW_SYSTEM_PROMPT},
             {"role": "user", "content": f"Title: {state['pr_title']}\nDiff:\n{state['pr_diff']}"},
         ])
-    console.print(f"  [green]✓[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
+    console.print(f"  [green]OK[/green] confidence={analysis.confidence:.0%}, {len(analysis.comments)} comment(s)")
     return {"analysis": analysis}
 
 
 def node_route(state: ReviewState) -> dict:
-    console.print("[cyan]→ route[/cyan]")
+    console.print("[cyan]-> route[/cyan]")
     c = state["analysis"].confidence
     if c >= AUTO_APPROVE_THRESHOLD: decision = "auto_approve"
     elif c < ESCALATE_THRESHOLD:    decision = "escalate"
     else:                           decision = "human_approval"
-    console.print(f"  [green]✓[/green] decision=[bold]{decision}[/bold] (confidence={c:.0%})")
+    console.print(f"  [green]OK[/green] decision=[bold]{decision}[/bold] (confidence={c:.0%})")
     return {"decision": decision}
 
 
 def node_human_approval(state: ReviewState) -> dict:
     """Pause and ask the human."""
     a = state["analysis"]
-    # TODO: call interrupt(payload) where payload contains these fields:
-    #         "kind": "approval_request",
-    #         "confidence": a.confidence,
-    #         "confidence_reasoning": a.confidence_reasoning,
-    #         "summary": a.summary,
-    #         "comments": [c.model_dump() for c in a.comments],
-    #         "diff_preview": state["pr_diff"][:2000],
-    # interrupt() returns whatever the caller passes via Command(resume=...).
-    # response = interrupt(...)
-    # return {"human_choice": response["choice"], "human_feedback": response.get("feedback")}
-    raise NotImplementedError("Call interrupt() with an approval_request payload")
+    response = interrupt({
+        "kind": "approval_request",
+        "pr_url": state["pr_url"],
+        "confidence": a.confidence,
+        "confidence_reasoning": a.confidence_reasoning,
+        "summary": a.summary,
+        "comments": [c.model_dump() for c in a.comments],
+        "diff_preview": state["pr_diff"][:2000],
+        "draft_review": _render_comment_body(state),
+    })
+    choice = response.get("choice")
+    if choice not in {"approve", "reject", "edit"}:
+        raise ValueError(f"Invalid reviewer choice: {choice!r}")
+    edited_review = response.get("edited_review") if choice == "edit" else None
+    if choice == "edit" and not (edited_review or "").strip():
+        raise ValueError("Edit requires a non-empty edited_review")
+    return {
+        "human_choice": choice,
+        "human_feedback": response.get("feedback"),
+        "edited_review": edited_review,
+    }
 
 
 def _render_comment_body(state: ReviewState) -> str:
     """Build the Markdown comment body posted back to the PR."""
+    if state.get("edited_review"):
+        return state["edited_review"].strip()
     a = state["analysis"]
     lines = [f"### Automated review (confidence {a.confidence:.0%})", "", a.summary, ""]
     for c in a.comments:
@@ -87,28 +100,38 @@ def _render_comment_body(state: ReviewState) -> str:
     return "\n".join(lines)
 
 
-def _post(state: ReviewState, label: str) -> str:
-    """Post the review comment to the PR. Returns the final_action string."""
+def _post(state: ReviewState, label: str) -> dict:
+    """Post once per thread and report only confirmed GitHub outcomes."""
+    body = _render_comment_body(state)
     try:
-        post_review_comment(state["pr_url"], _render_comment_body(state))
-        console.print(f"  [green]✓[/green] posted comment to {state['pr_url']}")
-        return label
+        result = post_review_comment(
+            state["pr_url"], body, idempotency_key=state.get("thread_id")
+        )
+        if result.status == "dry_run":
+            console.print("  [yellow]-[/yellow] dry-run: comment was not posted")
+            return {"final_action": "dry_run", "posted_comment_body": body}
+        console.print(f"  [green]OK[/green] {result.status} at {state['pr_url']}")
+        return {
+            "final_action": label,
+            "posted_comment_body": body,
+            "comment_url": result.url,
+        }
     except Exception as e:
-        console.print(f"  [red]✗[/red] post failed: {e}")
-        return "commit_failed"
+        console.print(f"  [red]ERROR[/red] post failed: {e}")
+        return {"final_action": "commit_failed"}
 
 
 def node_commit(state: ReviewState) -> dict:
-    console.print("[cyan]→ commit[/cyan]")
-    if state.get("human_choice") == "approve":
-        return {"final_action": _post(state, "committed")}
-    console.print(f"  [yellow]·[/yellow] skipping comment (choice={state.get('human_choice')})")
+    console.print("[cyan]-> commit[/cyan]")
+    if state.get("human_choice") in {"approve", "edit"}:
+        return _post(state, "committed")
+    console.print(f"  [yellow]-[/yellow] skipping comment (choice={state.get('human_choice')})")
     return {"final_action": "rejected"}
 
 
 def node_auto_approve(state):
-    console.print("[cyan]→ auto_approve[/cyan]  [dim]high confidence — posting directly[/dim]")
-    return {"final_action": _post(state, "auto_approved")}
+    console.print("[cyan]-> auto_approve[/cyan]  [dim]high confidence - posting directly[/dim]")
+    return _post(state, "auto_approved")
 
 
 def node_escalate(state):     return {"final_action": "pending_escalation"}
@@ -133,8 +156,7 @@ def build_graph():
     g.add_edge("human_approval", "commit")
     g.add_edge("commit", END)
     g.add_edge("escalate", END)
-    # TODO: compile with checkpointer=MemorySaver()
-    return g.compile()
+    return g.compile(checkpointer=MemorySaver())
 
 
 def prompt_human(payload: dict) -> dict:
@@ -155,7 +177,15 @@ def prompt_human(payload: dict) -> dict:
     while choice not in {"approve", "reject", "edit"}:
         choice = console.input("\n[bold]Choice (approve/reject/edit)?[/bold] ").strip().lower()
     feedback = console.input("Feedback: ").strip() if choice != "approve" else ""
-    return {"choice": choice, "feedback": feedback}
+    answer = {"choice": choice, "feedback": feedback}
+    if choice == "edit":
+        console.print("\n[dim]Current draft:[/dim]")
+        console.print(payload["draft_review"])
+        edited = console.input("\n[bold]Edited review Markdown:[/bold] ").strip()
+        while not edited:
+            edited = console.input("Edited review cannot be empty: ").strip()
+        answer["edited_review"] = edited
+    return answer
 
 
 def main() -> None:
@@ -174,12 +204,10 @@ def main() -> None:
 
     result = app.invoke({"pr_url": args.pr, "thread_id": thread_id}, cfg)
 
-    # TODO: write a `while "__interrupt__" in result:` loop:
-    #   - take payload from result["__interrupt__"][0].value
-    #   - call prompt_human(payload)
-    #   - resume with app.invoke(Command(resume=<answer>), cfg)
-    # while "__interrupt__" in result:
-    #     ...
+    while "__interrupt__" in result:
+        payload = result["__interrupt__"][0].value
+        answer = prompt_human(payload)
+        result = app.invoke(Command(resume=answer), cfg)
 
     console.rule("Done")
     console.print(result.get("final_action"))

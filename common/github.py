@@ -14,7 +14,9 @@ import httpx
 
 
 API = "https://api.github.com"
-PR_URL_RE = re.compile(r"github\.com/([^/]+)/([^/]+)/pull/(\d+)")
+PR_URL_RE = re.compile(
+    r"^https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/(\d+)/?$"
+)
 
 
 @dataclass
@@ -30,6 +32,18 @@ class PullRequest:
     head_sha: str
     diff: str
     files_changed: list[str]
+
+
+@dataclass(frozen=True)
+class CommentResult:
+    """Outcome of an idempotent GitHub comment operation."""
+
+    status: str
+    url: str | None = None
+
+    @property
+    def posted(self) -> bool:
+        return self.status in {"posted", "already_posted"}
 
 
 def _token() -> str:
@@ -52,7 +66,7 @@ def _headers(accept: str = "application/vnd.github+json") -> dict[str, str]:
 
 
 def parse_pr_url(pr_url: str) -> tuple[str, str, int]:
-    m = PR_URL_RE.search(pr_url)
+    m = PR_URL_RE.fullmatch(pr_url.strip())
     if not m:
         raise ValueError(f"Not a PR URL: {pr_url}")
     return m.group(1), m.group(2), int(m.group(3))
@@ -93,7 +107,12 @@ def fetch_pr(pr_url: str) -> PullRequest:
     )
 
 
-def post_review_comment(pr_url: str, body: str) -> None:
+def post_review_comment(
+    pr_url: str,
+    body: str,
+    *,
+    idempotency_key: str | None = None,
+) -> CommentResult:
     """Post a top-level discussion comment back to the PR.
 
     Uses the Issues endpoint (PRs are issues under the hood for top-level
@@ -103,7 +122,23 @@ def post_review_comment(pr_url: str, body: str) -> None:
     Takes the PR URL directly so callers don't need a `PullRequest` object.
     """
     owner, repo, number = parse_pr_url(pr_url)
+    if os.environ.get("HITL_DRY_RUN", "").lower() in {"1", "true", "yes"}:
+        return CommentResult(status="dry_run")
+
     url = f"{API}/repos/{owner}/{repo}/issues/{number}/comments"
+    marker = f"<!-- hitl-pr-review:{idempotency_key} -->" if idempotency_key else ""
+    final_body = f"{body}\n\n{marker}" if marker else body
     with httpx.Client(timeout=30.0) as client:
-        resp = client.post(url, headers=_headers(), json={"body": body})
+        if marker:
+            existing = client.get(
+                url, headers=_headers(), params={"per_page": 100, "sort": "created", "direction": "desc"}
+            )
+            existing.raise_for_status()
+            for comment in existing.json():
+                if marker in comment.get("body", ""):
+                    return CommentResult(status="already_posted", url=comment.get("html_url"))
+
+        resp = client.post(url, headers=_headers(), json={"body": final_body})
         resp.raise_for_status()
+        data = resp.json()
+        return CommentResult(status="posted", url=data.get("html_url"))

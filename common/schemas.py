@@ -1,5 +1,4 @@
-"""Shared types: the graph state, the LLM's structured analysis output,
-and the structured audit-trail entry written to PostgreSQL."""
+"""Shared models and LangGraph state for the PR review agent."""
 
 from __future__ import annotations
 
@@ -48,7 +47,11 @@ class PRAnalysis(BaseModel):
     comments: list[ReviewComment] = Field(default_factory=list)
     confidence: float = Field(
         ge=0.0, le=1.0,
-        description="Self-reported confidence that the review is complete and correct",
+        description=(
+            "Confidence that the review is complete and the change is understood and "
+            "low-risk enough for autonomous completion; this is not merely certainty "
+            "that an individual finding exists"
+        ),
     )
     confidence_reasoning: str = Field(
         description="Why the model picked that confidence value"
@@ -133,7 +136,11 @@ class ReviewState(TypedDict, total=False):
     human_choice: HumanChoice | None
     human_feedback: str | None
     escalation_answers: dict[str, str] | None
+    edited_review: str | None
+    require_final_confirmation: bool
+    final_confirmation: HumanChoice | None
 
     # Populated by commit / final nodes
     posted_comment_body: str | None
+    comment_url: str | None
     final_action: str | None
